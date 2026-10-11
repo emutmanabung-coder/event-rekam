@@ -1,0 +1,1057 @@
+node_modules/
+.DS_Store
+*.log
+
+/* Event Survei Jalan — Created and developed by HAFM@2026
+ * Aplikasi PWA tanpa framework & tanpa build. Data disimpan di IndexedDB (offline).
+ */
+'use strict';
+
+/* ───────── konfigurasi login ─────────
+ * Hash SHA-256 dari  "<user huruf kecil>|<password>|hafm2026".
+ * Untuk mengganti akun: hitung hash baru (lihat PANDUAN-GITHUB.md bagian "Ganti login"). */
+const AUTH_USER = 'admin';
+const AUTH_HASH = 'ebf95088ce922823bdbe0a8cf8910b96c35af069f4b54acef7ce29512fa000f1';
+const SESSION_KEY = 'es_session_v1';
+
+/* ───────── util ───────── */
+const $ = s => document.querySelector(s);
+const app = $('#app');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const pad = n => String(n).padStart(2, '0');
+const ALL_EVENTS = EVENT_GROUPS.flatMap(g => g.events.map(e => ({ ...e, group: g.key })));
+const evByCode = code => ALL_EVENTS.find(e => e.code === code);
+
+function fmtDate(t) { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function fmtTime(t) { const d = new Date(t); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+function fmtDur(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`; }
+function fmtSta(m) {
+  if (m === null || m === undefined || isNaN(m)) return '';
+  const neg = m < 0, a = Math.round(Math.abs(m));
+  return `${neg ? '-' : ''}${Math.floor(a / 1000)}+${pad3(a % 1000)}`;
+}
+function pad3(n) { return String(n).padStart(3, '0'); }
+/* "12+300" -> 12300 ;  "12300" -> 12300 (meter) */
+function parseSta(str) {
+  const s = String(str || '').trim().replace(',', '.');
+  let m = s.match(/^(\d+)\s*\+\s*(\d{1,3}(?:\.\d+)?)$/);
+  if (m) return parseInt(m[1], 10) * 1000 + parseFloat(m[2]);
+  if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+  return null;
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 1400);
+}
+function buzz(ms = 25) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) { /* abaikan */ } }
+
+function modal(html) {
+  const m = $('#modal'); m.innerHTML = `<div class="sheet">${html}</div>`; m.hidden = false;
+  m.onclick = e => { if (e.target === m) closeModal(); };
+  return m;
+}
+function closeModal() { const m = $('#modal'); m.hidden = true; m.innerHTML = ''; }
+function confirmBox(title, text, okLabel = 'Ya', danger = false) {
+  return new Promise(res => {
+    const m = modal(`<h3>${esc(title)}</h3><p class="muted">${esc(text)}</p>
+      <div class="row"><button class="btn ghost grow" data-r="0">Batal</button>
+      <button class="btn ${danger ? 'warn' : ''} grow" data-r="1">${esc(okLabel)}</button></div>`);
+    m.querySelectorAll('[data-r]').forEach(b => b.onclick = () => { closeModal(); res(b.dataset.r === '1'); });
+  });
+}
+
+/* ───────── database (IndexedDB) ───────── */
+const DB = (() => {
+  let db;
+  const open = () => new Promise((res, rej) => {
+    const r = indexedDB.open('event-survei', 1);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      d.createObjectStore('ruas', { keyPath: 'no' });
+      d.createObjectStore('surveys', { keyPath: 'id' });
+    };
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });
+  const all = store => new Promise((res, rej) => {
+    const q = db.transaction(store).objectStore(store).getAll();
+    q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
+  });
+  const put = (store, val) => new Promise((res, rej) => {
+    const tx = db.transaction(store, 'readwrite'); tx.objectStore(store).put(val);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+  const del = (store, key) => new Promise((res, rej) => {
+    const tx = db.transaction(store, 'readwrite'); tx.objectStore(store).delete(key);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+  return { open, all, put, del };
+})();
+
+const state = { ruas: [], surveys: [] };
+const saveRuas = r => DB.put('ruas', r);
+const saveSurvey = s => DB.put('surveys', s);
+const ruasOf = no => state.ruas.find(r => r.no === no);
+const surveysOf = no => state.surveys.filter(s => s.ruas === no).sort((a, b) => a.created - b.created);
+
+/* STA estimasi untuk sebuah event (hanya survei yang sudah selesai) */
+function estSta(s, ev) {
+  if (!s.end) return null;
+  let f;
+  if (s.dist >= 50 && ev.d !== undefined && ev.d !== null) f = ev.d / s.dist;
+  else { const T = s.end - s.start; if (T <= 0) return null; f = (ev.t - s.start) / T; }
+  f = Math.min(1, Math.max(0, f));
+  return s.staAwal + f * (s.staAkhir - s.staAwal);
+}
+
+/* ───────── autentikasi ───────── */
+async function sha256(txt) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(txt));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+const loggedIn = () => { try { return localStorage.getItem(SESSION_KEY) === '1'; } catch (e) { return false; } };
+function setLogged(v) { try { v ? localStorage.setItem(SESSION_KEY, '1') : localStorage.removeItem(SESSION_KEY); } catch (e) { /* abaikan */ } }
+
+function viewLogin() {
+  app.innerHTML = `<div class="login">
+    <img src="icons/icon-192.png" alt="">
+    <h1>Event Survei Jalan</h1><p>Silakan masuk untuk melanjutkan</p>
+    <form id="lf" autocomplete="off">
+      <label class="f" for="u">User</label><input id="u" type="text" autocapitalize="none" autocorrect="off" spellcheck="false">
+      <label class="f" for="p">Password</label>
+      <div class="pw"><input id="p" type="password" autocomplete="off"><button type="button" id="eye" aria-label="Tampilkan password">👁</button></div>
+      <div class="err" id="err"></div>
+      <button class="btn block" type="submit">Masuk</button>
+    </form>
+    <div class="foot">Created and developed by HAFM@2026</div></div>`;
+  $('#eye').onclick = () => { const p = $('#p'); p.type = p.type === 'password' ? 'text' : 'password'; };
+  $('#lf').onsubmit = async e => {
+    e.preventDefault();
+    const u = $('#u').value.trim().toLowerCase(), p = $('#p').value;
+    let ok = false;
+    try { ok = u === AUTH_USER && (await sha256(`${u}|${p}|hafm2026`)) === AUTH_HASH; } catch (err) { $('#err').textContent = 'Peramban tidak mendukung login aman.'; return; }
+    if (ok) { setLogged(true); location.hash = '#/ruas'; route(); }
+    else { $('#err').textContent = 'User atau password salah.'; buzz(120); }
+  };
+}
+
+/* ───────── kerangka halaman ───────── */
+function shell(title, sub, body, { back, nav = true, extra = '' } = {}) {
+  const cur = location.hash.split('/')[1] || 'ruas';
+  const tabs = [['ruas', '🛣️', 'Ruas'], ['db', '🗂️', 'Database'], ['about', 'ℹ️', 'About']];
+  app.innerHTML = `
+    <header class="top">${back ? `<button class="icon-btn" id="back" aria-label="Kembali">←</button>` : ''}
+      <h1>${esc(title)}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</h1>${extra}</header>
+    <main class="main">${body}</main>
+    ${nav ? `<nav class="nav">${tabs.map(t => `<a href="#/${t[0]}" class="${cur === t[0] || (t[0] === 'ruas' && cur === 'survey') ? 'on' : ''}"><span>${t[1]}</span>${t[2]}</a>`).join('')}</nav>` : ''}`;
+  if (back) $('#back').onclick = () => { if (typeof back === 'string') location.hash = back; else history.back(); };
+}
+
+/* ───────── daftar ruas ───────── */
+function viewRuas() {
+  const list = [...state.ruas].sort((a, b) => a.no.localeCompare(b.no, undefined, { numeric: true }));
+  const body = `
+    <div class="card">
+      <h2>Tambah ruas</h2>
+      <label class="f" for="rn">Nomor ruas</label><input id="rn" type="text" placeholder="mis. 001 atau 12.A" autocapitalize="characters">
+      <label class="f" for="rm">Nama ruas (opsional)</label><input id="rm" type="text" placeholder="mis. Jl. Kota A – Kota B">
+      <div class="err" id="rerr"></div>
+      <button class="btn block" id="addr">＋ Tambah Ruas</button>
+    </div>
+    <div class="grp">Daftar ruas (${list.length})</div>
+    ${list.length ? list.map(r => {
+      const ss = surveysOf(r.no), ne = ss.reduce((a, s) => a + s.events.length, 0), run = ss.some(s => !s.end);
+      return `<button class="item" data-no="${esc(r.no)}"><div class="row"><b class="grow">Ruas ${esc(r.no)}</b>${run ? '<span class="chip run">berjalan</span>' : ''}</div>
+        ${r.nama ? `<div class="muted small">${esc(r.nama)}</div>` : ''}
+        <div class="meta">${ss.length} survei · ${ne} event</div></button>`;
+    }).join('') : '<div class="empty">Belum ada ruas.<br>Tambahkan nomor ruas terlebih dahulu.</div>'}`;
+  shell('Ruas Jalan', 'Pilih atau tambah nomor ruas', body, { extra: `<button class="icon-btn" id="lo" aria-label="Keluar">⎋</button>` });
+  $('#lo').onclick = async () => { if (await confirmBox('Keluar?', 'Data tetap tersimpan di perangkat.', 'Keluar')) { setLogged(false); route(); } };
+  $('#addr').onclick = async () => {
+    const no = $('#rn').value.trim(), nama = $('#rm').value.trim();
+    if (!no) { $('#rerr').textContent = 'Nomor ruas wajib diisi.'; return; }
+    if (state.ruas.some(r => r.no.toLowerCase() === no.toLowerCase())) { $('#rerr').textContent = 'Nomor ruas sudah ada.'; return; }
+    const r = { no, nama, created: Date.now() };
+    await saveRuas(r); state.ruas.push(r); location.hash = '#/ruas/' + encodeURIComponent(no);
+  };
+  app.querySelectorAll('.item').forEach(b => b.onclick = () => { location.hash = '#/ruas/' + encodeURIComponent(b.dataset.no); });
+}
+
+/* ───────── detail ruas ───────── */
+function viewRuasDetail(no) {
+  const r = ruasOf(no); if (!r) { location.hash = '#/ruas'; return; }
+  const ss = surveysOf(no).reverse();
+  const body = `
+    <button class="btn block" id="newS">＋ Survei Baru</button>
+    <div class="grp" style="margin-top:16px">Riwayat survei (${ss.length})</div>
+    ${ss.length ? ss.map(s => `<button class="item" data-id="${s.id}">
+        <div class="row"><b class="grow">Pengulangan ke-${s.ulang}</b>
+          <span class="chip ${s.lajur === 'opposite' ? 'opp' : ''}">${s.lajur === 'opposite' ? 'Opposite' : 'Normal'}</span>
+          <span class="chip ${s.end ? '' : 'run'}">${s.end ? 'selesai' : 'berjalan'}</span></div>
+        <div class="meta">STA ${fmtSta(s.staAwal)} → ${fmtSta(s.staAkhir)} · ${s.events.length} event</div>
+        <div class="meta">${fmtDate(s.start)} ${fmtTime(s.start)}</div></button>`).join('')
+      : '<div class="empty">Belum ada survei untuk ruas ini.</div>'}
+    <button class="btn ghost block" id="delR" style="margin-top:14px;color:var(--danger)">Hapus ruas ini</button>`;
+  shell(`Ruas ${r.no}`, r.nama || 'Detail ruas', body, { back: '#/ruas' });
+  $('#newS').onclick = () => newSurveyForm(no);
+  app.querySelectorAll('.item').forEach(b => b.onclick = () => { location.hash = '#/survey/' + b.dataset.id; });
+  $('#delR').onclick = async () => {
+    if (!(await confirmBox('Hapus ruas?', `Ruas ${no} beserta ${ss.length} survei dan seluruh eventnya akan dihapus permanen.`, 'Hapus', true))) return;
+    for (const s of surveysOf(no)) { await DB.del('surveys', s.id); }
+    state.surveys = state.surveys.filter(s => s.ruas !== no);
+    await DB.del('ruas', no); state.ruas = state.ruas.filter(x => x.no !== no);
+    location.hash = '#/ruas';
+  };
+}
+
+function newSurveyForm(no) {
+  let lajur = 'normal';
+  const prefill = () => {
+    const last = surveysOf(no).filter(s => s.lajur === lajur).pop();
+    $('#sa').value = last ? fmtSta(last.staAwal) : ''; $('#sb').value = last ? fmtSta(last.staAkhir) : '';
+  };
+  const m = modal(`<h3>Survei baru — Ruas ${esc(no)}</h3>
+    <label class="f">Lajur</label>
+    <div class="seg" id="seg"><button data-l="normal" class="on">Normal</button><button data-l="opposite">Opposite</button></div>
+    <label class="f" for="sa">STA awal ruas</label><input id="sa" type="text" inputmode="text" placeholder="0+000" autocomplete="off">
+    <label class="f" for="sb">STA akhir ruas</label><input id="sb" type="text" inputmode="text" placeholder="5+250" autocomplete="off">
+    <p class="muted small">Format <b>km+meter</b> (mis. 12+300) atau meter saja (12300). Diisi sekali di awal.</p>
+    <div class="err" id="serr"></div>
+    <div class="row"><button class="btn ghost grow" id="c">Batal</button><button class="btn grow" id="go">Mulai Survei</button></div>`);
+  prefill();
+  m.querySelectorAll('#seg button').forEach(b => b.onclick = () => {
+    lajur = b.dataset.l; m.querySelectorAll('#seg button').forEach(x => x.classList.toggle('on', x === b)); prefill();
+  });
+  $('#c').onclick = closeModal;
+  $('#go').onclick = async () => {
+    const a = parseSta($('#sa').value), b = parseSta($('#sb').value);
+    if (a === null || b === null) { $('#serr').textContent = 'STA awal & akhir wajib diisi dengan format benar.'; return; }
+    if (a === b) { $('#serr').textContent = 'STA awal dan akhir tidak boleh sama.'; return; }
+    const ulang = Math.max(0, ...state.surveys.filter(s => s.ruas === no && s.lajur === lajur).map(s => s.ulang)) + 1;
+    const s = { id: uid(), ruas: no, lajur, ulang, staAwal: a, staAkhir: b, created: Date.now(), start: Date.now(), end: null, dist: 0, events: [] };
+    await saveSurvey(s); state.surveys.push(s); closeModal(); location.hash = '#/survey/' + s.id;
+  };
+}
+
+/* ───────── layar survei (pencatatan event) ───────── */
+const live = { timer: null, watch: null, wake: null, fix: null, lastPos: null, gps: 'off', dirty: false, saveT: null, subT: null, s: null };
+
+function stopLive() {
+  clearInterval(live.timer); clearInterval(live.saveT); clearTimeout(live.subT);
+  if (live.watch !== null) { try { navigator.geolocation.clearWatch(live.watch); } catch (e) { /* abaikan */ } }
+  if (live.wake) { try { live.wake.release(); } catch (e) { /* abaikan */ } }
+  if (live.s && live.dirty) saveSurvey(live.s);
+  Object.assign(live, { timer: null, watch: null, wake: null, fix: null, lastPos: null, gps: 'off', dirty: false, saveT: null, subT: null, s: null });
+}
+const hav = (a, b) => {
+  const R = 6371000, rad = x => x * Math.PI / 180;
+  const dLa = rad(b.lat - a.lat), dLo = rad(b.lon - a.lon);
+  const h = Math.sin(dLa / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+};
+function setGps(st) {
+  live.gps = st;
+  const el = $('#gps'); if (!el) return;
+  el.innerHTML = `<span class="dot ${st === 'ok' ? 'ok' : st === 'weak' ? 'weak' : ''}"></span>${st === 'ok' ? 'GPS' : st === 'weak' ? 'Lemah' : 'Off'}`;
+}
+function startGps() {
+  if (!navigator.geolocation) { setGps('off'); return; }
+  live.watch = navigator.geolocation.watchPosition(p => {
+    const s = live.s; if (!s || s.end) return;
+    const pos = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, t: Date.now() };
+    if (pos.acc > 40) { setGps('weak'); if (pos.acc <= 100) live.lastPos = pos; return; }
+    setGps('ok'); live.lastPos = pos;
+    if (live.fix) {
+      const d = hav(live.fix, pos);
+      if (d >= 4 && d < 300) { s.dist += d; live.fix = pos; live.dirty = true; }
+    } else live.fix = pos;
+  }, () => setGps('off'), { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
+}
+async function keepAwake() {
+  try { if (navigator.wakeLock && !live.s.end) live.wake = await navigator.wakeLock.request('screen'); } catch (e) { /* abaikan */ }
+}
+
+function viewSurvey(id) {
+  const s = state.surveys.find(x => x.id === id); if (!s) { location.hash = '#/ruas'; return; }
+  const r = ruasOf(s.ruas);
+  live.s = s;
+  const done = !!s.end;
+  const grid = g => `<div class="grp">${esc(g.title)}</div><div class="grid">${g.events.map(e =>
+    `<button class="ev ${g.key}" data-c="${e.code}"><span class="n"></span><b>${e.code}</b><small>${esc(e.name)}</small></button>`).join('')}</div>`;
+  const body = `
+    <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
+      <span class="chip ${s.lajur === 'opposite' ? 'opp' : ''}">${s.lajur === 'opposite' ? 'Opposite' : 'Normal'}</span>
+      <span class="chip">Ulang ke-${s.ulang}</span>
+      <span class="muted small">STA ${fmtSta(s.staAwal)} → ${fmtSta(s.staAkhir)}</span></div>
+    <div class="stats">
+      <div class="stat"><b id="tm">00:00:00</b><span>Waktu</span></div>
+      <div class="stat"><b id="cnt">0</b><span>Event</span></div>
+      <div class="stat"><b id="dst">0</b><span>Meter GPS</span></div>
+      <div class="stat"><b id="gps" style="font-size:14px;padding:4px 0"></b><span>Status</span></div>
+    </div>
+    <div class="${done ? 'locked' : ''}" id="evs">${EVENT_GROUPS.map(grid).join('')}</div>
+    <div class="subbar" id="subbar" hidden></div>
+    <div class="card log" style="margin-top:12px"><h3>Event terakhir</h3><div id="log"></div></div>
+    ${done ? `<div class="card"><p class="muted small">Survei selesai pada ${fmtDate(s.end)} ${fmtTime(s.end)}. Pencatatan dikunci. Buka kembali bila perlu menambah event.</p></div>` : ''}`;
+  shell(`Ruas ${s.ruas}`, `${s.lajur === 'opposite' ? 'Opposite' : 'Normal'} · Ulang ke-${s.ulang}`, body, { back: '#/ruas/' + encodeURIComponent(s.ruas), nav: false });
+  const bar = document.createElement('div'); bar.className = 'bar';
+  bar.innerHTML = done
+    ? `<button class="btn alt" id="reopen">Buka kembali</button><button class="btn" id="exp">Ekspor Excel</button>`
+    : `<button class="btn ghost" id="undo">↶ Batalkan</button><button class="btn warn" id="fin">Selesai</button>`;
+  app.appendChild(bar);
+
+  const refresh = () => {
+    $('#cnt').textContent = s.events.length;
+    $('#dst').textContent = Math.round(s.dist);
+    $('#tm').textContent = fmtDur((s.end || Date.now()) - s.start);
+    const counts = {}; s.events.forEach(e => counts[e.code] = (counts[e.code] || 0) + 1);
+    app.querySelectorAll('.ev').forEach(b => { b.querySelector('.n').textContent = counts[b.dataset.c] || ''; });
+    const last = s.events.slice(-3).reverse();
+    $('#log').innerHTML = last.length ? last.map(e => `<div class="li"><span class="code">${e.code}</span><span>${esc(e.sub ? e.sub + ' · ' : '')}${fmtTime(e.t)}</span><button class="x" data-del="${e.id}" aria-label="Hapus">✕</button></div>`).join('')
+      : '<div class="muted small">Belum ada event. Tekan tombol event di atas.</div>';
+    $('#log').querySelectorAll('[data-del]').forEach(b => b.onclick = () => removeEvent(b.dataset.del));
+  };
+  const hideSub = () => { $('#subbar').hidden = true; };
+  const showSub = (ev, def) => {
+    const sb = $('#subbar'); sb.hidden = false;
+    sb.innerHTML = `<div class="small"><b>${def.code}</b> tercatat — rincian (opsional):</div><div class="row">${def.subs.map(x => `<button data-sub="${esc(x)}" class="${ev.sub === x ? 'on' : ''}">${esc(x)}</button>`).join('')}</div>`;
+    sb.querySelectorAll('button').forEach(b => b.onclick = () => {
+      ev.sub = ev.sub === b.dataset.sub ? undefined : b.dataset.sub; saveSurvey(s); refresh(); showSub(ev, def); toast(ev.sub ? `${def.code}: ${ev.sub}` : 'Rincian dihapus');
+    });
+    clearTimeout(live.subT); live.subT = setTimeout(hideSub, 10000);
+  };
+  const removeEvent = id => { s.events = s.events.filter(e => e.id !== id); saveSurvey(s); hideSub(); refresh(); toast('Event dihapus'); };
+
+  /* ketuk tombol event = langsung tersimpan (tanpa tombol simpan) */
+  app.querySelectorAll('.ev').forEach(b => b.onclick = () => {
+    if (s.end) return;
+    const def = evByCode(b.dataset.c), now = Date.now();
+    const ev = { id: uid(), code: def.code, t: now, d: Math.round(s.dist) };
+    if (live.lastPos && now - live.lastPos.t < 30000) { ev.lat = +live.lastPos.lat.toFixed(6); ev.lon = +live.lastPos.lon.toFixed(6); }
+    s.events.push(ev); saveSurvey(s);
+    b.classList.add('hit'); setTimeout(() => b.classList.remove('hit'), 90);
+    buzz(); refresh(); toast(`${def.code} tercatat`);
+    if (def.subs) showSub(ev, def); else hideSub();
+  });
+
+  if (done) {
+    $('#reopen').onclick = async () => { s.end = null; await saveSurvey(s); route(); };
+    $('#exp').onclick = () => exportXlsx(s.ruas, s.id);
+  } else {
+    $('#undo').onclick = () => { const l = s.events[s.events.length - 1]; if (l) removeEvent(l.id); else toast('Belum ada event'); };
+    $('#fin').onclick = async () => {
+      if (!(await confirmBox('Selesaikan survei?', `${s.events.length} event akan dikunci. Anda tetap bisa membukanya kembali.`, 'Selesai'))) return;
+      s.end = Date.now(); await saveSurvey(s); live.dirty = false; route();
+    };
+    startGps(); setGps('off'); keepAwake();
+    live.saveT = setInterval(() => { if (live.dirty) { saveSurvey(s); live.dirty = false; } }, 8000);
+  }
+  live.timer = setInterval(() => { if (!s.end) refresh(); }, 1000);
+  refresh();
+}
+
+/* ───────── database / ekspor ───────── */
+function buildRows(ruasNo, surveyId) {
+  let ss = state.surveys.slice().sort((a, b) => a.ruas.localeCompare(b.ruas, undefined, { numeric: true }) || a.created - b.created);
+  if (ruasNo && ruasNo !== '*') ss = ss.filter(s => s.ruas === ruasNo);
+  if (surveyId) ss = ss.filter(s => s.id === surveyId);
+  const evHead = ['No', 'Nomor Ruas', 'Nama Ruas', 'Lajur', 'Pengulangan', 'STA Awal', 'STA Akhir', 'Tanggal', 'Jam', 'Kode Event', 'Keterangan Event', 'Rincian', 'Estimasi STA', 'Jarak GPS (m)', 'Latitude', 'Longitude'];
+  const evRows = [evHead]; let n = 0;
+  const svHead = ['Nomor Ruas', 'Nama Ruas', 'Lajur', 'Pengulangan', 'STA Awal', 'STA Akhir', 'Mulai', 'Selesai', 'Durasi', 'Jarak GPS (m)', 'Jumlah Event', 'Status'];
+  const svRows = [svHead];
+  for (const s of ss) {
+    const r = ruasOf(s.ruas) || {};
+    svRows.push([s.ruas, r.nama || '', s.lajur === 'opposite' ? 'Opposite' : 'Normal', s.ulang, fmtSta(s.staAwal), fmtSta(s.staAkhir),
+      `${fmtDate(s.start)} ${fmtTime(s.start)}`, s.end ? `${fmtDate(s.end)} ${fmtTime(s.end)}` : '', s.end ? fmtDur(s.end - s.start) : '',
+      Math.round(s.dist), s.events.length, s.end ? 'Selesai' : 'Berjalan']);
+    for (const e of s.events) {
+      const def = evByCode(e.code) || {};
+      evRows.push([++n, s.ruas, r.nama || '', s.lajur === 'opposite' ? 'Opposite' : 'Normal', s.ulang, fmtSta(s.staAwal), fmtSta(s.staAkhir),
+        fmtDate(e.t), fmtTime(e.t), e.code, def.full || '', e.sub || '', fmtSta(estSta(s, e)), e.d ?? '', e.lat ?? '', e.lon ?? '']);
+    }
+  }
+  const legend = [['Kelompok', 'Kode', 'Keterangan']];
+  EVENT_GROUPS.forEach(g => g.events.forEach(e => legend.push([g.title, e.code, e.full])));
+  return { evRows, svRows, legend };
+}
+
+function download(name, data, type) {
+  const url = URL.createObjectURL(new Blob([data], { type }));
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 4000);
+}
+const stamp = () => { const d = new Date(); return `${fmtDate(d)}_${pad(d.getHours())}${pad(d.getMinutes())}`; };
+const safe = s => String(s).replace(/[^\w.-]+/g, '_');
+
+function exportXlsx(ruasNo, surveyId) {
+  const { evRows, svRows, legend } = buildRows(ruasNo, surveyId);
+  if (evRows.length < 2 && svRows.length < 2) { toast('Belum ada data'); return; }
+  const bytes = XLSX.build([
+    { name: 'Event', rows: evRows, widths: [6, 12, 22, 10, 12, 10, 10, 12, 10, 11, 38, 10, 13, 13, 12, 12] },
+    { name: 'Survei', rows: svRows, widths: [12, 22, 10, 12, 10, 10, 20, 20, 10, 13, 13, 10] },
+    { name: 'Keterangan Event', rows: legend, widths: [12, 10, 48] }
+  ]);
+  const tag = ruasNo && ruasNo !== '*' ? 'Ruas' + safe(ruasNo) : 'SemuaRuas';
+  download(`Event_${tag}_${stamp()}.xlsx`, bytes, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  toast('File Excel dibuat');
+}
+const csvCell = v => { const s = String(v ?? ''); return /[",\n;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+function exportCsv(ruasNo) {
+  const { evRows } = buildRows(ruasNo);
+  if (evRows.length < 2) { toast('Belum ada event'); return; }
+  const tag = ruasNo && ruasNo !== '*' ? 'Ruas' + safe(ruasNo) : 'SemuaRuas';
+  download(`Event_${tag}_${stamp()}.csv`, '﻿' + evRows.map(r => r.map(csvCell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
+  toast('File CSV dibuat');
+}
+function exportJson() {
+  download(`Cadangan_EventSurvei_${stamp()}.json`, JSON.stringify({ app: 'event-survei', v: 1, ruas: state.ruas, surveys: state.surveys }), 'application/json');
+  toast('Cadangan dibuat');
+}
+function importJson() {
+  const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json,application/json';
+  inp.onchange = async () => {
+    try {
+      const j = JSON.parse(await inp.files[0].text());
+      if (j.app !== 'event-survei') throw new Error('bukan file cadangan');
+      for (const r of j.ruas || []) if (!ruasOf(r.no)) { await saveRuas(r); state.ruas.push(r); }
+      let add = 0;
+      for (const s of j.surveys || []) {
+        const i = state.surveys.findIndex(x => x.id === s.id);
+        if (i < 0) { state.surveys.push(s); add++; } else if ((s.events || []).length > state.surveys[i].events.length) state.surveys[i] = s; else continue;
+        await saveSurvey(s);
+      }
+      toast(`Impor selesai (${add} survei baru)`); route();
+    } catch (e) { toast('File cadangan tidak valid'); }
+  };
+  inp.click();
+}
+
+let dbSel = '*';
+function viewDb() {
+  if (dbSel !== '*' && !ruasOf(dbSel)) dbSel = '*';
+  const { evRows, svRows } = buildRows(dbSel);
+  const opts = ['<option value="*">Semua ruas</option>', ...state.ruas.sort((a, b) => a.no.localeCompare(b.no, undefined, { numeric: true })).map(r => `<option value="${esc(r.no)}" ${r.no === dbSel ? 'selected' : ''}>Ruas ${esc(r.no)}${r.nama ? ' — ' + esc(r.nama) : ''}</option>`)];
+  const cols = [0, 1, 3, 4, 7, 8, 9, 11, 12];
+  const table = rows => `<div class="tbl"><table><thead><tr>${cols.map(i => `<th>${esc(evRows[0][i])}</th>`).join('')}</tr></thead><tbody>${rows.slice(1).slice(-300).map(r => `<tr>${cols.map(i => `<td class="${i === 0 ? 'num' : ''}">${esc(r[i])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  const body = `
+    <div class="card"><label class="f" for="dsel" style="margin-top:0">Tampilkan data</label><select id="dsel">${opts.join('')}</select>
+      <p class="muted small" style="margin:8px 0 0">${svRows.length - 1} survei · ${evRows.length - 1} event${evRows.length > 301 ? ' (tabel menampilkan 300 terakhir; ekspor memuat semua)' : ''}</p></div>
+    ${evRows.length > 1 ? table(evRows) : '<div class="empty">Belum ada data event.</div>'}
+    <div class="grp">Ekspor &amp; cadangan</div>
+    <div class="row" style="flex-wrap:wrap">
+      <button class="btn grow" id="xl">⬇ Excel (.xlsx)</button><button class="btn alt grow" id="cs">⬇ CSV</button></div>
+    <div class="row" style="margin-top:10px;flex-wrap:wrap">
+      <button class="btn ghost grow sm" id="bk">Cadangan (.json)</button><button class="btn ghost grow sm" id="im">Pulihkan cadangan</button></div>
+    <p class="muted small">Data tersimpan di perangkat ini. Rutin ekspor / cadangkan agar aman bila data peramban terhapus.</p>`;
+  shell('Database', 'Sheet data event tersimpan', body);
+  $('#dsel').onchange = e => { dbSel = e.target.value; viewDb(); };
+  $('#xl').onclick = () => exportXlsx(dbSel); $('#cs').onclick = () => exportCsv(dbSel);
+  $('#bk').onclick = exportJson; $('#im').onclick = importJson;
+}
+
+/* ───────── about ───────── */
+function viewAbout() {
+  const body = `<div class="card about">
+    <h2>Event Survei Jalan</h2>
+    <h3>Gambaran singkat</h3>
+    <p style="margin:0">Aplikasi untuk mencatat kejadian (event) di lapangan selama survei jalan berlangsung — seperti marka kejut, gorong-gorong, jembatan, simpang, kerusakan, hingga kemacetan — per nomor ruas. Dapat dipasang di Android seperti aplikasi biasa dan bekerja tanpa internet.</p>
+    <h3>Cara kerja</h3>
+    <ol>
+      <li>Masuk dengan user &amp; password.</li>
+      <li>Di menu <b>Ruas</b>, tambahkan nomor ruas lalu pilih ruasnya.</li>
+      <li>Tekan <b>Survei Baru</b>: pilih lajur <b>Normal</b> atau <b>Opposite</b>, isi <b>STA awal</b> dan <b>STA akhir</b> sekali saja.</li>
+      <li>Saat berjalan, cukup <b>ketuk tombol event</b>. Setiap ketukan langsung tersimpan (tanpa tombol simpan) beserta waktu dan posisi GPS bila tersedia. Event KJ dan S menampilkan rincian opsional.</li>
+      <li>Salah ketuk? Gunakan <b>Batalkan terakhir</b> atau ✕ pada daftar event terakhir.</li>
+      <li>Tekan <b>Selesai</b> di ujung ruas. STA tiap event dihitung otomatis secara proporsional antara STA awal dan akhir (berdasarkan jarak GPS, atau waktu bila GPS tidak ada).</li>
+      <li>Survei dapat diulang berkali-kali untuk ruas yang sama (Pengulangan ke-1, 2, dst.). Lihat data di menu <b>Database</b> dan ekspor ke Excel / CSV.</li>
+    </ol>
+    <h3>Keterbatasan</h3>
+    <ul>
+      <li>Data tersimpan di penyimpanan peramban perangkat ini saja (tidak otomatis sinkron antar HP). Ekspor/cadangkan secara berkala; menghapus data situs/peramban atau mencopot aplikasi akan menghapus data.</li>
+      <li>STA event adalah <b>estimasi</b>, bukan pembacaan alat. Akurasi bergantung pada sinyal GPS dan kecepatan kendaraan yang relatif konstan.</li>
+      <li>Login bersifat lokal di perangkat — hanya penghalang akses biasa, bukan enkripsi data.</li>
+      <li>Setiap ketukan mencatat satu titik; belum ada pencatatan awal–akhir untuk event berdurasi (mis. macet).</li>
+      <li>Pencatatan tidak ada fitur jeda; hindari membiarkan survei berjalan saat kendaraan berhenti lama bila GPS tidak aktif.</li>
+      <li>Pembaruan aplikasi memerlukan koneksi internet sesekali saat dibuka.</li>
+    </ul>
+    <h3>Daftar kode event</h3>
+    <div class="tbl"><table class="legend"><tbody>${EVENT_GROUPS.map(g => `<tr><th colspan="2">${esc(g.title)}</th></tr>` + g.events.map(e => `<tr><td>${e.code}</td><td style="white-space:normal">${esc(e.full)}</td></tr>`).join('')).join('')}</tbody></table></div>
+    <p class="foot" style="margin-top:16px"><b>Created and developed by HAFM@2026</b></p></div>`;
+  shell('About', 'Tentang aplikasi', body);
+}
+
+/* ───────── router ───────── */
+function route() {
+  stopLive(); closeModal();
+  if (!loggedIn()) { viewLogin(); return; }
+  const [, p, arg] = location.hash.split('/');
+  const a = arg ? decodeURIComponent(arg) : '';
+  if (p === 'survey' && a) viewSurvey(a);
+  else if (p === 'ruas' && a) viewRuasDetail(a);
+  else if (p === 'db') viewDb();
+  else if (p === 'about') viewAbout();
+  else viewRuas();
+  window.scrollTo(0, 0);
+}
+window.addEventListener('hashchange', route);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && live.s && !live.s.end && !live.wake) keepAwake();
+  if (document.visibilityState === 'hidden' && live.s && live.dirty) { saveSurvey(live.s); live.dirty = false; }
+});
+
+(async function init() {
+  try { await DB.open(); } catch (e) { app.innerHTML = '<div class="empty">Penyimpanan lokal tidak tersedia di peramban ini.</div>'; return; }
+  [state.ruas, state.surveys] = await Promise.all([DB.all('ruas'), DB.all('surveys')]);
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* abaikan */ }
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { /* abaikan */ });
+  route();
+})();
+
+/* Daftar event — bersumber dari Event1.xlsx (sheet "Keterangan").
+ * Untuk menambah / mengubah event, cukup edit file ini lalu naikkan
+ * nomor VERSION di sw.js agar HP memperbarui cache.
+ *   code : kode singkat yang tampil di tombol
+ *   name : nama singkat di tombol
+ *   full : keterangan lengkap (dipakai di ekspor & About)
+ *   subs : (opsional) pilihan rincian yang muncul setelah tombol ditekan
+ */
+const EVENT_GROUPS = [
+  {
+    key: 'A', title: 'Event A',
+    events: [
+      { code: 'MK',  name: 'Marka Kejut',        full: 'Marka Kejut' },
+      { code: 'TM',  name: 'Tumpahan Material',  full: 'Tumpahan Material' },
+      { code: 'PT',  name: 'Polisi Tidur',       full: 'Polisi Tidur' },
+      { code: 'LP',  name: 'Lintasan / Galian Pipa', full: 'Lintasan Pipa / Galian Pipa' },
+      { code: 'KJ',  name: 'Kerusakan',          full: 'Kerusakan : Lubang/Patching/Amblas/Alur',
+        subs: ['Lubang', 'Patching', 'Amblas', 'Alur'] },
+      { code: 'BO',  name: 'Batas Overlay',      full: 'Batas Overlay' },
+      { code: 'BTN', name: 'Jalan Beton',        full: 'Jalan Beton' },
+      { code: 'LNG', name: 'Longsoran',          full: 'Longsoran' }
+    ]
+  },
+  {
+    key: 'B', title: 'Event B',
+    events: [
+      { code: 'B',  name: 'Berhenti / Macet',    full: 'Berhenti / Macet / Underspeed' },
+      { code: 'P',  name: 'Pasar / Peker. Jalan', full: 'Pasar / Pekerjaan Jalan / Pawai / Blokir' },
+      { code: 'TL', name: 'Lampu Lalu Lintas',   full: 'Lampu Lalu Lintas' },
+      { code: 'GG', name: 'Gorong-gorong',       full: 'Gorong-gorong' },
+      { code: 'J',  name: 'Jembatan',            full: 'Jembatan' },
+      { code: 'S',  name: 'Simpang',             full: 'Simpang ( 3 / 4 / 5 / 6 / 7 )',
+        subs: ['3', '4', '5', '6', '7'] }
+    ]
+  }
+];
+
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Event Survei Jalan</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="modal" hidden></div>
+  <script src="events.js"></script>
+  <script src="xlsx-lite.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
+
+{
+  "name": "Event Survei Jalan",
+  "short_name": "EventSurvei",
+  "description": "Pencatatan event survei jalan per nomor ruas, bekerja offline.",
+  "lang": "id",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f3f6f6",
+  "theme_color": "#0f766e",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
+
+# Panduan GitHub — Mengembangkan & Menerbitkan Event Survei Jalan
+
+Aplikasi ini adalah **PWA** (Progressive Web App): kumpulan file HTML/CSS/JS biasa tanpa build.
+Setelah diterbitkan di GitHub Pages (HTTPS), aplikasi dapat **dipasang di Android** dan **bekerja offline**.
+
+> Created and developed by HAFM@2026
+
+## Isi proyek
+
+| File | Fungsi |
+|---|---|
+| `index.html` | Kerangka halaman |
+| `app.js` | Seluruh logika: login, ruas, survei, event, database, ekspor, About |
+| `events.js` | **Daftar event** (kode, nama, rincian) — dari `Event1.xlsx` |
+| `xlsx-lite.js` | Pembuat file `.xlsx` (tanpa library, jalan offline) |
+| `styles.css` | Tampilan (ukuran dibuat nyaman untuk HP) |
+| `sw.js` | Service worker: menyimpan file aplikasi agar bisa offline |
+| `manifest.webmanifest` | Identitas aplikasi untuk instalasi Android |
+| `icons/` | Ikon aplikasi |
+| `.github/workflows/pages.yml` | Otomatis menerbitkan ke GitHub Pages |
+
+---
+
+## Bagian 1 — Persiapan (sekali saja)
+
+1. **Buat akun GitHub** di <https://github.com/signup> (lewati bila sudah punya).
+2. **Pasang Git** — <https://git-scm.com/downloads> (Windows: pilih opsi bawaan semua).
+   Cek di terminal / Git Bash: `git --version`
+3. **Atur identitas Git:**
+   ```bash
+   git config --global user.name  "Nama Anda"
+   git config --global user.email "email-akun-github@contoh.com"
+   ```
+4. **Pasang editor kode** — disarankan Visual Studio Code (<https://code.visualstudio.com>).
+5. **(Opsional) Python** untuk menguji lokal: <https://www.python.org/downloads/>
+
+## Bagian 2 — Menjalankan & menguji di komputer
+
+1. Ekstrak/salin folder proyek, mis. ke `C:\proyek\event-survei`.
+2. Buka terminal **di dalam folder itu**, lalu jalankan server lokal:
+   ```bash
+   python -m http.server 8080
+   ```
+   (Mac/Linux bisa `python3 -m http.server 8080`. Alternatif: `npx serve`.)
+3. Buka Chrome ke `http://localhost:8080`.
+   `localhost` dianggap aman oleh Chrome, jadi login (SHA-256), service worker, dan GPS bisa dicoba.
+4. Login: **User** `Admin`, **Password** `Hafm1002`.
+5. Uji offline: tekan **F12 → tab Application → Service Workers → centang Offline**, lalu muat ulang — aplikasi harus tetap terbuka.
+6. Untuk tampilan HP: **F12 → ikon ponsel (Toggle device toolbar)** → pilih mis. *Pixel 7*.
+
+> Membuka `index.html` langsung dengan klik ganda (alamat `file://`) **tidak** berfungsi penuh — selalu gunakan server lokal.
+
+## Bagian 3 — Membuat repository & mengunggah kode
+
+### Cara A — Terminal (disarankan)
+
+1. Di GitHub klik **+ → New repository**.
+   - Repository name: `event-survei`
+   - Pilih **Public** (GitHub Pages gratis memerlukan repo publik; repo privat butuh paket berbayar).
+   - **Jangan** centang "Add a README / .gitignore / license" (proyek sudah punya).
+   - Klik **Create repository**.
+2. Di terminal, dalam folder proyek:
+   ```bash
+   git init -b main
+   git add .
+   git commit -m "Versi awal Event Survei Jalan"
+   git remote add origin https://github.com/USERNAME/event-survei.git
+   git push -u origin main
+   ```
+   Ganti `USERNAME` dengan nama pengguna GitHub Anda.
+3. Saat diminta login: gunakan **Personal Access Token**, bukan password akun.
+   Buat di **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token**,
+   centang scope **repo** dan **workflow**, salin tokennya, tempel sebagai "password".
+   (Alternatif lebih mudah: pasang **GitHub Desktop** atau Git Credential Manager yang membuka login lewat browser.)
+
+### Cara B — Tanpa terminal (unggah lewat web)
+
+1. Buat repository seperti di atas, lalu klik **uploading an existing file**.
+2. Seret **seluruh isi folder** proyek (termasuk folder `icons` dan `.github`) ke halaman.
+   Catatan: folder tersembunyi `.github` kadang tidak ikut terseret di Windows — aktifkan *Show hidden files* dahulu.
+3. Klik **Commit changes**.
+
+## Bagian 4 — Menerbitkan lewat GitHub Pages
+
+1. Buka repository → **Settings → Pages**.
+2. Pada **Build and deployment → Source**, pilih **GitHub Actions**.
+3. Buka tab **Actions** → tunggu workflow **Deploy ke GitHub Pages** bertanda hijau ✔ (±1 menit).
+   Jika belum berjalan: klik workflow tersebut → **Run workflow**.
+4. Alamat aplikasi:
+   `https://USERNAME.github.io/event-survei/`
+   (juga tampil di Settings → Pages dan di ringkasan workflow).
+5. Buka alamat itu di Chrome HP untuk memastikan halaman login tampil.
+
+Bila Actions gagal dengan pesan *"Pages not enabled"*, ulangi langkah 1–2 lalu **Re-run jobs**.
+
+## Bagian 5 — Memasang di Android
+
+1. Buka `https://USERNAME.github.io/event-survei/` di **Chrome** (HP **harus online** untuk pemasangan pertama).
+2. Login sekali, biarkan halaman terbuka beberapa detik agar file tersimpan untuk offline.
+3. Ketuk **⋮ (menu Chrome) → Instal aplikasi** (atau *Tambahkan ke layar utama*) → **Instal**.
+4. Ikon **Event Survei** muncul di layar utama; buka dari sana (tampil layar penuh seperti aplikasi).
+5. **Uji offline:** aktifkan mode pesawat, buka aplikasi — harus tetap berjalan, data tetap ada.
+6. Izinkan **Lokasi** saat diminta (agar STA estimasi memakai jarak GPS; GPS tidak memerlukan internet).
+
+Tips lapangan: matikan penghemat baterai agresif untuk Chrome, dan tempatkan HP agar GPS memiliki langit terbuka.
+
+## Bagian 6 — Alur kerja pengembangan yang rapi
+
+```bash
+git checkout -b fitur/nama-fitur      # 1. cabang baru
+# ... ubah kode, uji di http://localhost:8080 ...
+git add .
+git commit -m "Tambah: penjelasan singkat"
+git push -u origin fitur/nama-fitur   # 2. unggah cabang
+```
+3. Di GitHub klik **Compare & pull request** → **Create pull request** → periksa → **Merge**.
+4. Setelah merge ke `main`, workflow menerbitkan otomatis.
+5. Tarik pembaruan di komputer: `git checkout main && git pull`.
+
+### ⚠️ Aturan emas: naikkan versi cache
+
+Setiap mengubah file aplikasi, buka `sw.js` dan naikkan nomor:
+```js
+const VERSION = 'v2';   // sebelumnya 'v1'
+```
+Tanpa ini HP tetap memakai file lama dari cache.
+**Memperbarui di HP:** buka aplikasi saat online → tutup penuh (geser dari daftar aplikasi) → buka lagi. Versi baru aktif pada pembukaan berikutnya.
+Data survei **tidak terhapus** saat pembaruan.
+
+## Bagian 7 — Perubahan yang sering dilakukan
+
+### Menambah / mengubah event
+Edit `events.js`. Contoh menambah event baru di kelompok A:
+```js
+{ code: 'RM', name: 'Rambu Rusak', full: 'Rambu Rusak / Hilang' },
+```
+Event dengan rincian pilihan: tambahkan `subs: ['a','b']`. Naikkan `VERSION` di `sw.js`.
+
+### Mengganti user / password
+1. Hitung hash baru (ganti `PASSWORDBARU`; user selalu huruf kecil):
+   ```bash
+   node -e "console.log(require('crypto').createHash('sha256').update('admin|PASSWORDBARU|hafm2026').digest('hex'))"
+   ```
+   (Tanpa Node: `python -c "import hashlib;print(hashlib.sha256(b'admin|PASSWORDBARU|hafm2026').hexdigest())"`)
+2. Di `app.js`, ubah `AUTH_USER` dan `AUTH_HASH` (di bagian atas file).
+3. Naikkan `VERSION`, commit, push.
+
+> Login ini hanya pembatas akses di sisi perangkat. Siapa pun yang membuka kode sumber dapat melihat hash-nya. Jangan menyimpan data rahasia.
+
+### Mengganti ikon / nama
+Ganti file di `icons/` (PNG 192, 512, dan maskable 512 piksel) dan ubah `name` / `short_name` di `manifest.webmanifest`. Copot lalu pasang ulang aplikasi di HP agar ikon baru terbaca.
+
+### Mengubah kolom ekspor
+Fungsi `buildRows()` di `app.js` menyusun kolom sheet **Event** dan **Survei**.
+
+## Bagian 8 — Hal penting soal data
+
+- Data tersimpan di **IndexedDB** peramban pada HP tersebut. Tidak ada server, tidak ada sinkronisasi.
+- **Jangan** mencopot aplikasi atau menghapus "data situs" Chrome sebelum mengekspor.
+- Ekspor rutin: menu **Database → Excel / CSV** (hasil unduhan ada di folder *Download*), dan **Cadangan (.json)** untuk dipulihkan kembali lewat **Pulihkan cadangan** (juga untuk memindahkan data ke HP lain).
+- Pembaruan kode tidak mengubah data tersimpan, selama alamat (domain + nama repo) tidak berubah. Jika nama repo diganti, alamatnya berubah dan data lama tidak ikut — ekspor cadangan dulu.
+
+## Bagian 9 — (Opsional) Menjadikan file APK
+
+Instalasi lewat Chrome sudah cukup. Bila butuh file `.apk` untuk dibagikan:
+1. Buka <https://www.pwabuilder.com>, masukkan alamat GitHub Pages Anda, klik **Start**.
+2. Setelah skor PWA tampil, pilih **Package for stores → Android → Generate**.
+3. Unduh paketnya; berkas `.apk` dapat dipasang langsung di HP (aktifkan *Install unknown apps*). Simpan juga file *signing key* yang diberikan untuk pembaruan berikutnya.
+
+## Pemecahan masalah
+
+| Gejala | Solusi |
+|---|---|
+| Tombol "Instal aplikasi" tidak muncul | Pastikan alamat `https://`, buka ulang halaman, tunggu beberapa detik, lalu cek menu ⋮ Chrome. |
+| Halaman 404 setelah deploy | Tunggu 1–2 menit; pastikan **Settings → Pages → Source = GitHub Actions** dan workflow hijau. |
+| Perubahan kode tidak tampil di HP | Naikkan `VERSION` di `sw.js`, push, lalu buka–tutup–buka aplikasi saat online. |
+| Login selalu salah | Pastikan user `Admin` & password `Hafm1002` (huruf besar/kecil berpengaruh untuk password). Jika Anda mengganti hash, periksa rumus `user|password|hafm2026`. |
+| GPS "Off" / "Lemah" | Izinkan lokasi untuk Chrome, aktifkan GPS "akurasi tinggi", keluar ruangan. Event tetap tercatat dengan estimasi STA berdasar waktu. |
+| `git push` ditolak (authentication) | Gunakan Personal Access Token (Bagian 3), bukan password akun. |
+| Workflow gagal: izin | **Settings → Actions → General → Workflow permissions → Read and write**, lalu Re-run. |
+
+---
+**Created and developed by HAFM@2026**
+
+# Event Survei Jalan
+
+Aplikasi PWA Android (offline) untuk mencatat event survei jalan per nomor ruas — lajur Normal/Opposite,
+STA awal–akhir sekali input, ketuk event langsung tersimpan, data tersimpan di database lokal dan dapat diekspor ke Excel/CSV.
+
+- Login awal: **Admin** / **Hafm1002**
+- Panduan lengkap pengembangan & penerbitan di GitHub: [PANDUAN-GITHUB.md](PANDUAN-GITHUB.md)
+- Uji lokal: `python -m http.server 8080` lalu buka http://localhost:8080
+
+Created and developed by HAFM@2026
+
+:root {
+  --bg: #f3f6f6; --card: #ffffff; --ink: #14232b; --muted: #5b6e75; --line: #d9e2e4;
+  --brand: #0f766e; --brand-d: #0b5c56; --brand-l: #d8efec;
+  --a: #b45309; --a-bg: #fff4e0; --a-line: #f3c98b;
+  --b: #1d4ed8; --b-bg: #e8efff; --b-line: #aac0f5;
+  --danger: #b91c1c; --ok: #15803d;
+  --r: 14px;
+  --sat: env(safe-area-inset-top, 0px); --sab: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1719; --card: #172326; --ink: #e8f0f1; --muted: #93a8ae; --line: #2a3b3f;
+    --brand: #2bb3a6; --brand-d: #1f8f85; --brand-l: #17383a;
+    --a: #fbbf6a; --a-bg: #2d2314; --a-line: #5a4320;
+    --b: #8fb0ff; --b-bg: #16213d; --b-line: #2f4580;
+    --danger: #f87171; --ok: #4ade80;
+  }
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  touch-action: manipulation; overscroll-behavior-y: contain;
+}
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; border: 0; }
+[hidden] { display: none !important; }
+
+#app { min-height: 100%; display: flex; flex-direction: column; max-width: 560px; margin: 0 auto; }
+.top {
+  position: sticky; top: 0; z-index: 5; background: var(--brand); color: #fff;
+  padding: calc(10px + var(--sat)) 14px 10px; display: flex; align-items: center; gap: 10px;
+}
+.top h1 { font-size: 18px; margin: 0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.top .sub { font-size: 12px; opacity: .85; display: block; font-weight: 400; }
+.icon-btn { background: rgba(255,255,255,.16); color: #fff; width: 42px; height: 42px; border-radius: 12px; font-size: 20px; flex: none; }
+.main { flex: 1; padding: 14px 14px calc(86px + var(--sab)); }
+.nav {
+  position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 560px;
+  background: var(--card); border-top: 1px solid var(--line); display: flex; padding-bottom: var(--sab); z-index: 6;
+}
+.nav a { flex: 1; text-align: center; padding: 9px 4px 8px; text-decoration: none; color: var(--muted); font-size: 12px; font-weight: 600; }
+.nav a span { display: block; font-size: 22px; line-height: 1.1; }
+.nav a.on { color: var(--brand); }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; margin-bottom: 12px; }
+.card h2, .card h3 { margin: 0 0 6px; font-size: 16px; }
+.muted { color: var(--muted); font-size: 14px; }
+.small { font-size: 13px; }
+label.f { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+input[type=text], input[type=password], select {
+  width: 100%; height: 50px; padding: 0 14px; border-radius: 12px; border: 1.5px solid var(--line);
+  background: var(--card); font-size: 17px;
+}
+input:focus, select:focus { outline: 3px solid var(--brand-l); border-color: var(--brand); }
+.btn { height: 50px; padding: 0 18px; border-radius: 12px; font-weight: 700; background: var(--brand); color: #fff; font-size: 16px; }
+.btn:active { background: var(--brand-d); }
+.btn.alt { background: var(--brand-l); color: var(--brand-d); }
+@media (prefers-color-scheme: dark) { .btn.alt { color: var(--brand); } }
+.btn.warn { background: var(--danger); }
+.btn.ghost { background: transparent; border: 1.5px solid var(--line); color: var(--ink); }
+.btn.block { width: 100%; }
+.btn.sm { height: 40px; font-size: 14px; padding: 0 12px; }
+.row { display: flex; gap: 10px; align-items: center; }
+.row > * { min-width: 0; }
+.grow { flex: 1; }
+.seg { display: flex; background: var(--bg); border: 1.5px solid var(--line); border-radius: 12px; padding: 3px; gap: 3px; }
+.seg button { flex: 1; height: 44px; border-radius: 9px; background: transparent; font-weight: 700; color: var(--muted); }
+.seg button.on { background: var(--brand); color: #fff; }
+.chip { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 12px; font-weight: 700; background: var(--brand-l); color: var(--brand-d); }
+@media (prefers-color-scheme: dark) { .chip { color: var(--brand); } }
+.chip.run { background: #fde68a; color: #7c4a03; }
+.chip.opp { background: #ede0ff; color: #5b21b6; }
+.item { display: block; width: 100%; text-align: left; background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 13px 14px; margin-bottom: 10px; }
+.item:active { background: var(--brand-l); }
+.item b { font-size: 17px; }
+.item .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+.empty { text-align: center; color: var(--muted); padding: 30px 10px; }
+
+/* login */
+.login { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 24px 22px; }
+.login img { width: 84px; height: 84px; border-radius: 20px; align-self: center; box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+.login h1 { text-align: center; margin: 14px 0 2px; font-size: 24px; }
+.login p { text-align: center; margin: 0 0 22px; color: var(--muted); }
+.err { color: var(--danger); font-weight: 600; min-height: 22px; margin: 8px 0; font-size: 14px; }
+.pw { position: relative; }
+.pw button { position: absolute; right: 6px; top: 6px; height: 38px; width: 44px; background: transparent; font-size: 18px; }
+.foot { text-align: center; font-size: 12px; color: var(--muted); padding: 12px 0; }
+
+/* survey */
+.stats { display: flex; gap: 8px; margin-bottom: 10px; }
+.stat { flex: 1; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 7px 10px; text-align: center; }
+.stat b { display: block; font-size: 19px; font-variant-numeric: tabular-nums; }
+.stat span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #9ca3af; margin-right: 5px; }
+.dot.ok { background: var(--ok); } .dot.weak { background: #f59e0b; }
+.grp { font-size: 12px; font-weight: 800; letter-spacing: .08em; color: var(--muted); margin: 10px 2px 6px; text-transform: uppercase; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.ev {
+  position: relative; min-height: 78px; border-radius: 14px; padding: 6px 4px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center; border: 2px solid; line-height: 1.15;
+  transition: transform .06s;
+}
+.ev:active, .ev.hit { transform: scale(.94); }
+.ev b { font-size: 24px; letter-spacing: .02em; }
+.ev small { font-size: 11px; margin-top: 2px; opacity: .9; }
+.ev.A { background: var(--a-bg); border-color: var(--a-line); color: var(--a); }
+.ev.B { background: var(--b-bg); border-color: var(--b-line); color: var(--b); }
+.ev .n { position: absolute; top: 4px; right: 6px; font-size: 12px; font-weight: 800; min-width: 20px; height: 20px; border-radius: 10px; background: var(--ink); color: var(--card); line-height: 20px; padding: 0 5px; }
+.ev .n:empty { display: none; }
+.locked .ev { opacity: .45; pointer-events: none; }
+.subbar { background: var(--card); border: 1.5px dashed var(--brand); border-radius: 12px; padding: 8px 10px; margin-top: 10px; }
+.subbar .row { flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.subbar button { height: 40px; padding: 0 14px; border-radius: 10px; background: var(--brand-l); color: var(--brand-d); font-weight: 700; }
+.subbar button.on { background: var(--brand); color: #fff; }
+.log .li { display: flex; align-items: center; gap: 10px; padding: 2px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.log .li:last-child { border: 0; }
+.log .code { font-weight: 800; min-width: 44px; }
+.log .x { margin-left: auto; background: transparent; color: var(--danger); font-size: 18px; width: 36px; height: 36px; }
+.bar { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 560px; display: flex; gap: 10px; padding: 10px 14px calc(10px + var(--sab)); background: var(--card); border-top: 1px solid var(--line); z-index: 6; }
+.bar .btn { flex: 1; }
+
+/* table */
+.tbl { overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--card); max-height: 60vh; }
+table { border-collapse: collapse; font-size: 13px; white-space: nowrap; }
+th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+th { position: sticky; top: 0; background: var(--brand-l); z-index: 1; }
+td.num, th.num { text-align: right; }
+
+/* modal + toast */
+#modal { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 20; display: flex; align-items: flex-end; justify-content: center; }
+#modal .sheet { background: var(--card); width: 100%; max-width: 560px; border-radius: 20px 20px 0 0; padding: 18px 16px calc(18px + var(--sab)); max-height: 92vh; overflow: auto; }
+#modal h3 { margin: 0 0 8px; font-size: 18px; }
+#toast { position: fixed; left: 50%; bottom: calc(150px + var(--sab)); transform: translate(-50%, 20px); background: rgba(20,35,43,.94); color: #fff; padding: 10px 16px; border-radius: 99px; font-weight: 700; opacity: 0; pointer-events: none; transition: .18s; z-index: 30; max-width: 90vw; text-align: center; }
+#toast.show { opacity: 1; transform: translate(-50%, 0); }
+.about h3 { margin: 16px 0 4px; font-size: 16px; color: var(--brand); }
+.about ul, .about ol { margin: 4px 0 0; padding-left: 20px; }
+.about li { margin-bottom: 4px; }
+.legend td:first-child { font-weight: 800; }
+
+/* Service worker: menyimpan seluruh file aplikasi agar bisa dibuka offline.
+ * PENTING: setiap kali Anda mengubah file aplikasi, naikkan VERSION
+ * (mis. v1 -> v2) supaya HP mengunduh versi terbaru. */
+const VERSION = 'v1';
+const CACHE = 'event-survei-' + VERSION;
+const ASSETS = [
+  './', './index.html', './styles.css', './app.js', './events.js', './xlsx-lite.js',
+  './manifest.webmanifest',
+  './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png', './icons/apple-touch-icon.png'
+];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k.startsWith('event-survei-') && k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', e => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  e.respondWith(
+    caches.match(req, { ignoreSearch: true }).then(hit => {
+      if (hit) return hit;
+      return fetch(req).catch(() => (req.mode === 'navigate' ? caches.match('./index.html') : Response.error()));
+    })
+  );
+});
+
+/* Pembuat file .xlsx minimal tanpa library (offline, tanpa dependensi).
+ * XLSX.build([{name, rows:[[...],[...]], widths:[..]}]) -> Uint8Array
+ * Baris pertama otomatis dicetak tebal. Sel angka disimpan sebagai angka.
+ */
+const XLSX = (() => {
+  const enc = new TextEncoder();
+  const crcTable = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  const esc = s => String(s)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  function colName(i) {
+    let s = '';
+    for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + ((i - 1) % 26)) + s;
+    return s;
+  }
+
+  function sheetXml(rows, widths) {
+    let x = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>';
+    if (widths) {
+      x += '<cols>' + widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('') + '</cols>';
+    }
+    x += '<sheetData>';
+    rows.forEach((row, r) => {
+      x += `<row r="${r + 1}">`;
+      row.forEach((v, c) => {
+        if (v === null || v === undefined || v === '') return;
+        const ref = colName(c) + (r + 1);
+        const st = r === 0 ? ' s="1"' : '';
+        if (typeof v === 'number' && isFinite(v)) x += `<c r="${ref}"${st}><v>${v}</v></c>`;
+        else x += `<c r="${ref}"${st} t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`;
+      });
+      x += '</row>';
+    });
+    return x + '</sheetData></worksheet>';
+  }
+
+  function zip(files) {
+    const parts = [], central = [];
+    let offset = 0;
+    const u16 = n => [n & 255, (n >> 8) & 255];
+    const u32 = n => [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >>> 24) & 255];
+    for (const f of files) {
+      const name = enc.encode(f.name), data = enc.encode(f.data), crc = crc32(data);
+      const head = new Uint8Array([
+        0x50, 0x4b, 3, 4, 20, 0, 0, 8, 0, 0, 0, 0, 0x21, 0,
+        ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), 0, 0]);
+      parts.push(head, name, data);
+      central.push(new Uint8Array([
+        0x50, 0x4b, 1, 2, 20, 0, 20, 0, 0, 8, 0, 0, 0, 0, 0x21, 0,
+        ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length),
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...u32(offset)]), name);
+      offset += head.length + name.length + data.length;
+    }
+    const cdSize = central.reduce((a, b) => a + b.length, 0);
+    const end = new Uint8Array([0x50, 0x4b, 5, 6, 0, 0, 0, 0, ...u16(files.length), ...u16(files.length),
+      ...u32(cdSize), ...u32(offset), 0, 0]);
+    const all = [...parts, ...central, end];
+    const out = new Uint8Array(all.reduce((a, b) => a + b.length, 0));
+    let p = 0;
+    for (const a of all) { out.set(a, p); p += a.length; }
+    return out;
+  }
+
+  function build(sheets) {
+    const files = [
+      { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+          sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('') + '</Types>' },
+      { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+      { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+          sheets.map((s, i) => `<sheet name="${esc(s.name.slice(0, 31))}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') + '</sheets></workbook>' },
+      { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          sheets.map((s, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('') +
+          `<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>` },
+      { name: 'xl/styles.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFCCE8E4"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>' }
+    ];
+    sheets.forEach((s, i) => files.push({ name: `xl/worksheets/sheet${i + 1}.xml`, data: sheetXml(s.rows, s.widths) }));
+    return zip(files);
+  }
+  return { build };
+})();
